@@ -1,8 +1,9 @@
 /**
  * CLI de credenciales.
  *
- *   npm run creds:export              -> escribe data/wa-creds.b64 y resume el contenido
- *   npm run creds:export -- --stdout  -> solo el blob por stdout (para pipes)
+ *   npm run creds:export                    -> escribe data/wa-creds.b64 y resume el contenido
+ *   npm run creds:export -- --prekeys 0     -> blob minimo (~6 KB) para meterlo en una env var
+ *   npm run creds:export -- --stdout        -> solo el blob por stdout (para pipes)
  *   npm run creds:import -- --force   -> rehidrata data/auth.sqlite desde WA_CREDS
  */
 
@@ -39,7 +40,20 @@ const kb = (bytes: number): string => `${(bytes / 1024).toFixed(1)} KB`
 function runExport(): void {
     ensureDirs()
     const sessionId = valueOf('--session') ?? undefined
-    const payload = exportCredentials(sessionId === undefined ? {} : { sessionId })
+
+    const rawPreKeys = valueOf('--prekeys')
+    let keepPreKeys: number | null = null
+    if (rawPreKeys !== null) {
+        keepPreKeys = Number(rawPreKeys)
+        if (!Number.isInteger(keepPreKeys) || keepPreKeys < 0) {
+            throw new CredsError(`--prekeys espera un entero >= 0, no "${rawPreKeys}".`)
+        }
+    }
+
+    const payload = exportCredentials({
+        ...(sessionId === undefined ? {} : { sessionId }),
+        keepPreKeys
+    })
 
     if (has('--stdout')) {
         process.stdout.write(payload.base64)
@@ -55,6 +69,14 @@ function runExport(): void {
     console.log(`  sqlite podado ${kb(payload.rawBytes)} -> gzip ${kb(payload.gzipBytes)} -> base64 ${payload.base64Chars} chars`)
     console.log('  tablas        ' + Object.entries(payload.tables).map(([t, n]) => `${t}=${n}`).join(' '))
     console.log('')
+
+    if (keepPreKeys !== null) {
+        console.log(
+            `Prekeys podados a ${keepPreKeys}. No es una perdida: al conectar, el digest del servidor\n` +
+                'no cuadra con el bundle local y zapo sube un lote nuevo de 812 automaticamente.'
+        )
+        console.log('')
+    }
 
     // 128 KB es el tope habitual de una sola variable de entorno en Linux (MAX_ARG_STRLEN).
     if (payload.base64Chars > 120_000) {
@@ -114,7 +136,7 @@ try {
     else {
         console.error('uso: creds-cli <export|import> [opciones]')
         console.error('')
-        console.error('  export [--out <archivo>] [--stdout] [--session <id>]')
+        console.error('  export [--out <archivo>] [--stdout] [--session <id>] [--prekeys <n>]')
         console.error('  import [--in <archivo>] [--stdin] [--force]')
         process.exitCode = 2
     }
