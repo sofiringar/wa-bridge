@@ -99,8 +99,8 @@ Escribe `data/wa-creds.b64` (modo `600`) y resume que viaja dentro:
 credenciales exportadas -> /ruta/data/wa-creds.b64
   cuenta        5215500001111:12@s.whatsapp.net — Sofia
   sesiones      default
-  sqlite podado 96.0 KB -> gzip 4.6 KB -> base64 6256 chars
-  tablas        auth_credentials=1 signal_identity=15 signal_meta=1 signal_prekey=60 ...
+  sqlite podado 176.0 KB -> gzip 69.7 KB -> base64 95184 chars
+  tablas        auth_credentials=1 signal_identity=1 signal_meta=1 signal_prekey=812 ...
 ```
 
 En el otro ambiente, define **una** de estas dos variables:
@@ -128,16 +128,41 @@ npm run creds:import -- --in data/wa-creds.b64 --force
 
 Se exporta `data/auth.sqlite` entero **menos** el buzon de historial
 (`mailbox_*`), los caches reconstruibles y las colas de reintento — de ahi que un store
-de 16 MB quepa en ~6 KB de base64. Lo que si viaja es todo el material criptografico:
+de 16 MB quepa en ~95 KB de base64. Lo que si viaja es todo el material criptografico:
 credenciales Noise, identidad, prekeys, sesiones y claves Signal, y la tabla
 `wa_migrations` (asi la version que importe no re-aplica migraciones ya aplicadas).
+
+Como la sesion restaurada **no** trae el buzon, arranca con el archivo de mensajes vacio.
+WhatsApp solo empuja el historial completo al emparejar, no al reanudar: el ambiente nuevo
+ve los mensajes de ahi en adelante, y para lo anterior esta el backfill bajo demanda que
+encola la API.
 
 La copia se hace con `VACUUM INTO`, que toma una instantanea consistente **aunque el
 daemon este corriendo**; copiar el `.sqlite` a pelo dejaria cambios sin checkpoint en el
 `-wal` y produciria un store vacio o corrupto.
 
-`WA_CREDS` cabe en una variable de entorno normal (el tope en Linux ronda los 128 KB); si
-tu export se acerca a ese limite, el CLI te avisa y te dice que uses `WA_CREDS_FILE`.
+### Si el blob es demasiado grande
+
+Casi todo el peso son los **prekeys de un solo uso**: zapo sube un lote de 812 al
+emparejar, y son ~84 KB de los 176 KB del store. Son tambien lo unico que el cliente sabe
+regenerar solo, asi que se pueden dejar fuera:
+
+```bash
+npm run creds:export -- --prekeys 0     # 95 184 -> 6 564 chars de base64
+```
+
+No se pierde nada. Al conectar, zapo compara su bundle local contra el digest que tiene el
+servidor; al no encontrar los prekeys responde `missing_local_prekey` con `shouldReupload`,
+y sube un lote nuevo de 812 acto seguido. Lo que **no** se puede podar es la identidad de
+la sesion — `auth_credentials`, `signal_identity`, `signal_registration` y
+`signal_signed_prekey` —: eso es la sesion misma, y sin ello vuelves al QR.
+
+`--prekeys <n>` acepta cualquier entero: `0` da el blob minimo, y un valor intermedio
+(50, 100) conserva parte del lote a cambio de mas tamano.
+
+Sin podar, `WA_CREDS` todavia cabe en una variable de entorno normal (el tope de Linux
+para una sola variable ronda los 128 KB); si tu export se acerca a ese limite, el CLI te
+avisa y te dice que uses `WA_CREDS_FILE`.
 
 > **El blob es una credencial completa**: da acceso total a la cuenta de WhatsApp, sin
 > segundo factor. Trátalo como una contraseña — secreto de CI, nunca en el repo. Está en
