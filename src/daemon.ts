@@ -1,4 +1,7 @@
 import { createSqliteStore } from '@zapo-js/store-sqlite'
+import { rmSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { toFile as qrToFile } from 'qrcode'
 import qrcode from 'qrcode-terminal'
 import { ConsoleLogger, createStore, WaClient, type WaStoreSession } from 'zapo-js'
 import { config, ensureDirs } from './config.js'
@@ -151,14 +154,30 @@ function scheduleReconcile(delayMs = 5_000): void {
 
 // --- eventos -------------------------------------------------------------
 
+// En un ambiente headless (contenedor, CI, Claude Code en la web) el QR en ASCII no se
+// puede escanear desde el telefono: se deja ademas como PNG para poder abrirlo o bajarlo.
+const qrImagePath = resolve(config.dataDir, 'qr.png')
+
+async function writeQrImage(qr: string): Promise<void> {
+    try {
+        await qrToFile(qrImagePath, qr, { type: 'png', width: 512, margin: 2 })
+        log(`QR tambien escrito en ${qrImagePath}`)
+    } catch (error) {
+        log('no se pudo escribir el PNG del QR:', error)
+    }
+}
+
 client.on('auth_qr', ({ qr }) => {
     log('Escanea este QR desde WhatsApp > Dispositivos vinculados:')
     qrcode.generate(qr, { small: true })
+    void writeQrImage(qr)
 })
 
 client.on('auth_paired', ({ credentials }) => {
     log('emparejado como', credentials.meJid)
     setMeta('me_jid', String(credentials.meJid ?? ''))
+    // El QR ya caduco; dejarlo en disco solo confunde al siguiente que mire la carpeta.
+    rmSync(qrImagePath, { force: true })
 })
 
 client.on('message', (event) => {

@@ -13,6 +13,13 @@
  * Por que el archivo entero y no un JSON de filas: preserva el esquema y la tabla
  * `wa_migrations`, asi que la version de @zapo-js/store-sqlite que lo importe no
  * intenta re-aplicar migraciones sobre datos que ya las tienen.
+ *
+ * Sobre el tamano: casi todo el peso son los 812 prekeys de un solo uso (~84 KB de 176 KB),
+ * y son justo lo que el cliente sabe regenerar. Al conectar, zapo compara su bundle local
+ * contra el digest del servidor; si faltan prekeys responde `missing_local_prekey` con
+ * `shouldReupload`, y sube un lote nuevo. Por eso `keepPreKeys` puede podarlos y dejar el
+ * blob en unos pocos KB. Lo que NO se puede tocar es la identidad: `auth_credentials`,
+ * `signal_identity`, `signal_registration` y `signal_signed_prekey` son la sesion misma.
  */
 
 import { ensureSqliteMigrations, openSqliteConnection, type WaSqliteMigrationDomain } from '@zapo-js/store-sqlite'
@@ -69,6 +76,12 @@ export interface CredsPayload {
     tables: Record<string, number>
 }
 
+export interface ExportOptions {
+    sessionId?: string | null
+    /** Prekeys de un solo uso a conservar. `null`/ausente = todos. */
+    keepPreKeys?: number | null
+}
+
 export class CredsError extends Error {}
 
 function tableNames(db: Database.Database): string[] {
@@ -85,10 +98,13 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
 /**
  * Empaqueta el store de autenticacion en una cadena base64.
  *
- * @param sessionId Si se indica, solo viajan las filas de esa sesion. Por defecto, la
- *                  del `.env` (`SESSION_ID`).
+ * @param sessionId   Si se indica, solo viajan las filas de esa sesion. Por defecto, la
+ *                    del `.env` (`SESSION_ID`).
+ * @param keepPreKeys Cuantos prekeys de un solo uso conservar. `null` (por defecto) los
+ *                    lleva todos; `0` los deja fuera y el cliente sube un lote nuevo en
+ *                    la primera conexion.
  */
-export function exportCredentials(options: { sessionId?: string | null } = {}): CredsPayload {
+export function exportCredentials(options: ExportOptions = {}): CredsPayload {
     if (!existsSync(config.authPath)) {
         throw new CredsError(
             `No existe ${config.authPath}. Empareja primero el telefono con "npm run daemon" y vuelve a intentarlo.`
@@ -124,6 +140,22 @@ export function exportCredentials(options: { sessionId?: string | null } = {}): 
                     pruned.prepare(`DELETE FROM "${table}" WHERE session_id <> ?`).run(sessionId)
                 }
             }
+        }
+
+        // Los prekeys de un solo uso son el grueso del blob y el cliente los regenera:
+        // el digest del servidor no cuadra al conectar y zapo sube un lote nuevo.
+        const keepPreKeys = options.keepPreKeys ?? null
+        if (keepPreKeys !== null && (!Number.isInteger(keepPreKeys) || keepPreKeys < 0)) {
+            throw new CredsError(`keepPreKeys debe ser un entero >= 0, no ${keepPreKeys}.`)
+        }
+        if (keepPreKeys !== null && present.has('signal_prekey')) {
+            // Los mas recientes son los que mas probablemente sigan sin usar en el servidor.
+            pruned
+                .prepare(
+                    `DELETE FROM signal_prekey
+                     WHERE rowid NOT IN (SELECT rowid FROM signal_prekey ORDER BY rowid DESC LIMIT ?)`
+                )
+                .run(keepPreKeys)
         }
 
         const credentials = pruned
