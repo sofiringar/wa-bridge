@@ -6,7 +6,7 @@ import qrcode from 'qrcode-terminal'
 import { ConsoleLogger, createStore, WaClient, type WaStoreSession } from 'zapo-js'
 import { config, ensureDirs } from './config.js'
 import { CredsError, ensureVolatileTables, restoreFromEnvIfNeeded } from './creds.js'
-import { finishSyncRequest, globalStats, type MessageInput, setMeta, takePendingSyncRequests, upsertChat } from './db.js'
+import { finishSyncRequest, globalStats, listChats, type MessageInput, setMeta, takePendingSyncRequests, upsertChat } from './db.js'
 import { fromLiveEvent, fromStoredRecord, persist } from './ingest.js'
 
 ensureDirs()
@@ -118,7 +118,17 @@ async function reconcile(): Promise<void> {
     reconciling = true
     try {
         const session = store.session(config.sessionId)
-        const threads = await session.threads.list(5000)
+        // `session.threads.list()` solo trae lo que zapo registro como hilo (se llena en
+        // el pareo inicial). Una sesion reanudada desde WA_CREDS nunca pasa por ahi, asi
+        // que el buzon puede tener mensajes de chats que zapo no conoce como "thread": se
+        // completa con los chats que wa-bridge ya descubrio (bootstrapArchive) para no
+        // dejarlos fuera de la reconciliacion.
+        const zapoThreads = await session.threads.list(5000)
+        const threadsByJid = new Map(zapoThreads.map((t) => [t.jid, t]))
+        for (const chat of listChats({ limit: 5000 })) {
+            if (!threadsByJid.has(chat.jid)) threadsByJid.set(chat.jid, { jid: chat.jid, name: chat.name ?? undefined })
+        }
+        const threads = [...threadsByJid.values()]
         const names = new Map<string, string | null>()
         let total = 0
 
