@@ -84,6 +84,87 @@ ráfagas y el daemon lo va copiando. Comprueba el avance con `/health`.
 
 ---
 
+## Credenciales portables
+
+Emparejas el telefono **una vez** y te llevas la sesion a otro ambiente (contenedor, CI,
+otra maquina) como una sola cadena base64, sin volver a escanear el QR.
+
+```bash
+npm run creds:export
+```
+
+Escribe `data/wa-creds.b64` (modo `600`) y resume que viaja dentro:
+
+```
+credenciales exportadas -> /ruta/data/wa-creds.b64
+  cuenta        5215500001111:12@s.whatsapp.net — Sofia
+  sesiones      default
+  sqlite podado 96.0 KB -> gzip 4.6 KB -> base64 6256 chars
+  tablas        auth_credentials=1 signal_identity=15 signal_meta=1 signal_prekey=60 ...
+```
+
+En el otro ambiente, define **una** de estas dos variables:
+
+| Variable | Contenido |
+|---|---|
+| `WA_CREDS` | El blob base64 en la propia variable |
+| `WA_CREDS_FILE` | La ruta a un archivo que lo contiene |
+
+```bash
+export WA_CREDS="$(cat data/wa-creds.b64)"
+npm run daemon          # arranca ya emparejado, sin QR
+```
+
+El daemon las rehidrata **solo si no existe `data/auth.sqlite`**: un store local siempre
+gana, porque reimportar por encima de una sesion viva la rompe. Tambien puedes
+materializarlas a mano:
+
+```bash
+npm run creds:import              # desde WA_CREDS / WA_CREDS_FILE
+npm run creds:import -- --in data/wa-creds.b64 --force
+```
+
+### Que viaja y que no
+
+Se exporta `data/auth.sqlite` entero **menos** el buzon de historial
+(`mailbox_*`), los caches reconstruibles y las colas de reintento — de ahi que un store
+de 16 MB quepa en ~6 KB de base64. Lo que si viaja es todo el material criptografico:
+credenciales Noise, identidad, prekeys, sesiones y claves Signal, y la tabla
+`wa_migrations` (asi la version que importe no re-aplica migraciones ya aplicadas).
+
+La copia se hace con `VACUUM INTO`, que toma una instantanea consistente **aunque el
+daemon este corriendo**; copiar el `.sqlite` a pelo dejaria cambios sin checkpoint en el
+`-wal` y produciria un store vacio o corrupto.
+
+`WA_CREDS` cabe en una variable de entorno normal (el tope en Linux ronda los 128 KB); si
+tu export se acerca a ese limite, el CLI te avisa y te dice que uses `WA_CREDS_FILE`.
+
+> **El blob es una credencial completa**: da acceso total a la cuenta de WhatsApp, sin
+> segundo factor. Trátalo como una contraseña — secreto de CI, nunca en el repo. Está en
+> `.gitignore`, y para revocarlo basta con cerrar el dispositivo vinculado desde el
+> teléfono.
+
+---
+
+## Comprobacion sin WhatsApp
+
+```bash
+npm run selftest
+```
+
+Mete protobufs sintéticos (texto, cita, imagen con miniatura, nota de voz, mensaje
+efímero, mensaje de protocolo, encuesta) por el mismo camino que usa la reconciliación
+del buzón y comprueba el resultado en la base: tipos, `quotedId`, poda de miniaturas,
+idempotencia y filtrado por rango. Útil para validar un ambiente nuevo antes de
+emparejar, o tras tocar `extract.ts` / `codec.ts`. Usa `DATA_DIR` para no pisar tu
+archivo real:
+
+```bash
+DATA_DIR=/tmp/wa-selftest npm run selftest
+```
+
+---
+
 ## API
 
 Todas las respuestas son JSON. Si defines `API_KEY` en `.env`, manda el header
@@ -223,6 +304,9 @@ la condición `servable` en [`src/api.ts`](src/api.ts) — el descifrado ya es g
 | [`src/codec.ts`](src/codec.ts) | Codificación/decodificación del protobuf archivado |
 | [`src/media.ts`](src/media.ts) | Descarga y descifrado desde el CDN de Meta |
 | [`src/deepgram.ts`](src/deepgram.ts) | Transcripción |
+| [`src/creds.ts`](src/creds.ts) | Exportación / importación portable de la sesión |
+| [`src/creds-cli.ts`](src/creds-cli.ts) | CLI de `creds:export` / `creds:import` |
+| [`src/selftest.ts`](src/selftest.ts) | Verificación del pipeline sin WhatsApp |
 
 ## Problemas conocidos
 
@@ -232,3 +316,11 @@ la condición `servable` en [`src/api.ts`](src/api.ts) — el descifrado ya es g
   entre en el buzón.
 - **No abras dos daemons sobre el mismo `data/`**: el store de zapo es de un solo
   escritor.
+- **`optional dependency "ws" is not installed`**: zapo declara `ws` como peer
+  dependency opcional pero el transporte WebSocket lo necesita siempre. Ya va declarado
+  en `package.json`; si ves este error, corre `npm install`.
+- **Red restringida**: el daemon necesita WebSocket saliente a `web.whatsapp.com`
+  (443 y 5222), `mmg.whatsapp.net` para la media y `api.deepgram.com` para transcribir.
+  Detrás de un proxy que no tuneliza WebSocket, el arranque falla con
+  `comms connection timeout`; el daemon lo registra y reintenta con backoff en vez de
+  morirse.

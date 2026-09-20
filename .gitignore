@@ -3,3 +3,5 @@ data/
 .env
 .gh-token
 *.log
+data/wa-creds.b64
+*.b64

@@ -2,12 +2,26 @@ import { createSqliteStore } from '@zapo-js/store-sqlite'
 import qrcode from 'qrcode-terminal'
 import { ConsoleLogger, createStore, WaClient, type WaStoreSession } from 'zapo-js'
 import { config, ensureDirs } from './config.js'
+import { CredsError, restoreFromEnvIfNeeded } from './creds.js'
 import { finishSyncRequest, type MessageInput, setMeta, takePendingSyncRequests } from './db.js'
 import { fromLiveEvent, fromStoredRecord, persist } from './ingest.js'
 
 ensureDirs()
 
 const log = (...args: unknown[]): void => console.log(new Date().toISOString(), ...args)
+
+// Ambiente nuevo sin store local pero con credenciales en el entorno (WA_CREDS o
+// WA_CREDS_FILE): se rehidrata data/auth.sqlite antes de abrir el store, y asi se
+// reanuda la sesion ya emparejada sin volver a escanear el QR.
+try {
+    restoreFromEnvIfNeeded(log)
+} catch (error) {
+    if (error instanceof CredsError) {
+        log('no se pudieron restaurar las credenciales del entorno:', error.message)
+        process.exit(1)
+    }
+    throw error
+}
 
 const store = createStore({
     backends: { sqlite: createSqliteStore({ path: config.authPath }) },
@@ -254,4 +268,11 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'))
 
 setMeta('daemon_started_at', String(Math.floor(Date.now() / 1000)))
 log('conectando...')
-await client.connect()
+// Un fallo en el primer connect() entra en la misma escalera de reintentos que una
+// caida posterior; dejarlo escapar aqui tumbaba el proceso sin reintentar ni una vez.
+try {
+    await client.connect()
+} catch (error) {
+    log('fallo la conexion inicial:', error)
+    void reconnect()
+}
