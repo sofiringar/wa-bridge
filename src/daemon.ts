@@ -5,8 +5,8 @@ import { toFile as qrToFile } from 'qrcode'
 import qrcode from 'qrcode-terminal'
 import { ConsoleLogger, createStore, WaClient, type WaStoreSession } from 'zapo-js'
 import { config, ensureDirs } from './config.js'
-import { CredsError, restoreFromEnvIfNeeded } from './creds.js'
-import { finishSyncRequest, type MessageInput, setMeta, takePendingSyncRequests } from './db.js'
+import { CredsError, ensureVolatileTables, restoreFromEnvIfNeeded } from './creds.js'
+import { finishSyncRequest, globalStats, type MessageInput, setMeta, takePendingSyncRequests, upsertChat } from './db.js'
 import { fromLiveEvent, fromStoredRecord, persist } from './ingest.js'
 
 ensureDirs()
@@ -17,7 +17,10 @@ const log = (...args: unknown[]): void => console.log(new Date().toISOString(), 
 // WA_CREDS_FILE): se rehidrata data/auth.sqlite antes de abrir el store, y asi se
 // reanuda la sesion ya emparejada sin volver a escanear el QR.
 try {
-    restoreFromEnvIfNeeded(log)
+    await restoreFromEnvIfNeeded(log)
+    // Un store rehidratado de un blob antiguo llega sin las tablas del buzon: conecta
+    // bien y muere en la primera reconciliacion. Para un store sano esto es un no-op.
+    await ensureVolatileTables(log)
 } catch (error) {
     if (error instanceof CredsError) {
         log('no se pudieron restaurar las credenciales del entorno:', error.message)
@@ -192,6 +195,49 @@ client.on('history_sync_chunk', (event) => {
     scheduleReconcile()
 })
 
+// --- arranque de un archivo vacio ----------------------------------------
+
+let bootstrapped = false
+
+/**
+ * Siembra la lista de chats cuando el archivo esta vacio.
+ *
+ * No es un history sync: el volcado del historial solo se emite **al emparejar** y
+ * WhatsApp no lo repite, asi que un store rehidratado desde WA_CREDS reanuda la sesion
+ * pero sin buzon. Los mensajes que lleguen a partir de ahora entran solos — al
+ * reconectar, el servidor descarga la rafaga de lo acumulado mientras estabamos fuera
+ * (offline resume) y sale por el evento `message` como cualquier mensaje en vivo.
+ *
+ * Lo unico que hay que pedir explicitamente es lo que esa rafaga no trae: la lista de
+ * grupos (IQ al servidor) y el app state (libreta de contactos, que el store restaurado
+ * tampoco conserva). Ambas son consultas puntuales, no un volcado de historial.
+ *
+ * Solo corre con el archivo vacio: en arranques posteriores ya hay chats y la rafaga de
+ * reconexion basta para mantenerlo al dia.
+ */
+async function bootstrapArchive(): Promise<void> {
+    if (bootstrapped) return
+    bootstrapped = true
+
+    try {
+        const result = await client.chat.sync()
+        const mutations = result.collections.reduce((total, c) => total + (c.mutations?.length ?? 0), 0)
+        log(`app state sincronizado: ${mutations} mutaciones`)
+    } catch (error) {
+        log('app state no sincronizo:', error)
+    }
+
+    try {
+        const groups = await client.group.queryAllGroups()
+        for (const group of groups) {
+            upsertChat({ jid: group.jid, name: group.subject, kind: 'group' })
+        }
+        log(`grupos descubiertos: ${groups.length}`)
+    } catch (error) {
+        log('no se pudieron listar los grupos:', error)
+    }
+}
+
 // --- reconexion ----------------------------------------------------------
 
 const MAX_ATTEMPTS = 12
@@ -205,6 +251,7 @@ client.on('connection', (event) => {
         log('conectado')
         // Al abrir, el buzon puede traer lo que llego mientras estabamos fuera.
         scheduleReconcile(10_000)
+        if (globalStats().chats === 0) void bootstrapArchive()
         return
     }
 

@@ -22,6 +22,7 @@
  * `signal_identity`, `signal_registration` y `signal_signed_prekey` son la sesion misma.
  */
 
+import { ensureSqliteMigrations, openSqliteConnection, type WaSqliteMigrationDomain } from '@zapo-js/store-sqlite'
 import Database from 'better-sqlite3'
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -29,8 +30,15 @@ import { gunzipSync, gzipSync } from 'node:zlib'
 import { config } from './config.js'
 
 /**
- * Tablas que NO viajan: buzon de historial (puede pesar cientos de MB), caches
- * reconstruibles y colas de reintento. Nada de esto hace falta para reanudar la sesion.
+ * Tablas cuyo CONTENIDO no viaja: buzon de historial (puede pesar cientos de MB),
+ * caches reconstruibles y colas de reintento. Nada de esto hace falta para reanudar la
+ * sesion.
+ *
+ * Viajan vacias, no eliminadas: `wa_migrations` viaja intacta, asi que el store que
+ * importe da por aplicadas sus migraciones y nunca vuelve a crearlas. Un `DROP TABLE`
+ * aqui dejaba un store sin `mailbox_*` que reventaba en el primer `threads.list()`
+ * con "no such table: mailbox_threads". Con `DELETE` el esquema sobrevive y el VACUUM
+ * final recupera igual todo el espacio.
  */
 const VOLATILE_TABLES = [
     'mailbox_messages',
@@ -42,7 +50,13 @@ const VOLATILE_TABLES = [
     'message_secrets_cache',
     'retry_inbound_counters',
     'retry_outbound_messages',
-    'appstate_collection_index_values'
+    'appstate_collection_index_values',
+    // Las versiones acompanan a los index values: si viajan ellas pero no ellos, el
+    // ambiente nuevo se cree al dia y pide patches desde esa version, con lo que el
+    // snapshot que trae contactos y chats no vuelve a bajar nunca. Vacias, el primer
+    // `chat.sync()` hace sincronizacion completa. Las claves (`appstate_sync_keys`) si
+    // viajan: son material criptografico, no cache.
+    'appstate_collection_versions'
 ] as const
 
 /** Los 16 bytes de cabecera de todo archivo SQLite: "SQLite format 3\0". */
@@ -116,7 +130,7 @@ export function exportCredentials(options: ExportOptions = {}): CredsPayload {
         const present = new Set(tableNames(pruned))
 
         for (const table of VOLATILE_TABLES) {
-            if (present.has(table)) pruned.exec(`DROP TABLE "${table}"`)
+            if (present.has(table)) pruned.exec(`DELETE FROM "${table}"`)
         }
 
         // Un mismo store puede alojar varias sesiones; no arrastres las ajenas.
@@ -192,6 +206,108 @@ export function exportCredentials(options: ExportOptions = {}): CredsPayload {
     return payload
 }
 
+/**
+ * Todos los dominios de migracion de @zapo-js/store-sqlite. Se usan para levantar un
+ * store de referencia del que copiar el esquema que le falte a un blob antiguo.
+ */
+const MIGRATION_DOMAINS: readonly WaSqliteMigrationDomain[] = [
+    'auth',
+    'signal',
+    'senderKey',
+    'appState',
+    'retry',
+    'participants',
+    'deviceList',
+    'mailbox',
+    'privacyToken',
+    'messageSecret',
+    'chatMetadata'
+]
+
+/**
+ * DDL (tabla + sus indices) de un store recien migrado, indexado por tabla.
+ *
+ * Se saca de `sqlite_master` de una base vacia en lugar de escribirlo a mano: asi el
+ * esquema recreado es exactamente el que produce la version instalada de la libreria,
+ * incluidas migraciones posteriores que alteran columnas.
+ */
+async function referenceSchema(): Promise<Map<string, string[]>> {
+    const scratch = resolve(config.dataDir, `creds-schema-${process.pid}.sqlite`)
+    const cleanup = (): void => {
+        for (const suffix of ['', '-wal', '-shm']) rmSync(`${scratch}${suffix}`, { force: true })
+    }
+
+    cleanup()
+    const connection = await openSqliteConnection({ path: scratch, sessionId: config.sessionId })
+    try {
+        await ensureSqliteMigrations(connection, MIGRATION_DOMAINS)
+
+        // Las tablas primero: un indice no se puede crear antes que su tabla.
+        const rows = connection.all<{ tbl_name: string; sql: string }>(
+            `SELECT tbl_name, sql FROM sqlite_master
+             WHERE sql IS NOT NULL
+             ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, rowid`
+        )
+
+        const byTable = new Map<string, string[]>()
+        for (const row of rows) {
+            const statements = byTable.get(row.tbl_name) ?? []
+            statements.push(row.sql)
+            byTable.set(row.tbl_name, statements)
+        }
+        return byTable
+    } finally {
+        connection.close()
+        cleanup()
+    }
+}
+
+/**
+ * Recrea las tablas volatiles que falten en un store.
+ *
+ * Solo hace algo con blobs generados por la version antigua del exportador, que las
+ * eliminaba en vez de vaciarlas; para un store sano es una consulta a `sqlite_master`
+ * y nada mas.
+ */
+async function healVolatileTables(db: Database.Database): Promise<string[]> {
+    const present = new Set(tableNames(db))
+    const missing = VOLATILE_TABLES.filter((table) => !present.has(table))
+    if (missing.length === 0) return []
+
+    const schema = await referenceSchema()
+    for (const table of missing) {
+        const statements = schema.get(table)
+        if (!statements || statements.length === 0) {
+            throw new CredsError(
+                `Al store le falta la tabla "${table}" y la version instalada de ` +
+                    '@zapo-js/store-sqlite no la define: no se puede reparar automaticamente.'
+            )
+        }
+        for (const sql of statements) db.exec(sql)
+    }
+    return [...missing]
+}
+
+/**
+ * Repara `data/auth.sqlite` in situ si le faltan tablas volatiles.
+ *
+ * El daemon la llama al arrancar: un store importado de un blob antiguo conectaba bien
+ * pero moria en la primera reconciliacion, y reimportar encima habria tirado el estado
+ * de sesion que ya hubiera avanzado.
+ */
+export async function ensureVolatileTables(log: (...args: unknown[]) => void = console.log): Promise<string[]> {
+    if (!existsSync(config.authPath)) return []
+
+    const db = new Database(config.authPath)
+    try {
+        const healed = await healVolatileTables(db)
+        if (healed.length > 0) log(`tablas recreadas en el store: ${healed.join(', ')}`)
+        return healed
+    } finally {
+        db.close()
+    }
+}
+
 export interface ImportSummary {
     authPath: string
     bytes: number
@@ -232,7 +348,7 @@ function decode(blob: string): Buffer {
  * store a medias. Los `-wal` / `-shm` viejos se borran, porque pertenecen al archivo
  * anterior y SQLite los daria por buenos.
  */
-export function importCredentials(blob: string, options: { force?: boolean } = {}): ImportSummary {
+export async function importCredentials(blob: string, options: { force?: boolean } = {}): Promise<ImportSummary> {
     const raw = decode(blob)
 
     if (existsSync(config.authPath) && !options.force) {
@@ -271,12 +387,27 @@ export function importCredentials(blob: string, options: { force?: boolean } = {
         throw new CredsError(`El blob no es un store de zapo valido: ${(error as Error).message}`)
     }
 
+    // Reparar aqui y no sobre el destino: un blob que no se pueda arreglar no debe
+    // llegar a pisar el store que ya hubiera.
+    try {
+        const staged = new Database(staging)
+        try {
+            await healVolatileTables(staged)
+        } finally {
+            staged.close()
+        }
+    } catch (error) {
+        for (const suffix of ['', '-wal', '-shm']) rmSync(`${staging}${suffix}`, { force: true })
+        if (error instanceof CredsError) throw error
+        throw new CredsError(`No se pudo reparar el esquema del store importado: ${(error as Error).message}`)
+    }
+
     rmSync(`${config.authPath}-wal`, { force: true })
     rmSync(`${config.authPath}-shm`, { force: true })
     rmSync(config.authPath, { force: true })
     // renameSync via writeFile+rm ya hecho: movemos el staging validado a su sitio.
     writeFileSync(config.authPath, readFileSync(staging))
-    rmSync(staging, { force: true })
+    for (const suffix of ['', '-wal', '-shm']) rmSync(`${staging}${suffix}`, { force: true })
 
     return summary
 }
@@ -302,7 +433,7 @@ export function credsFromEnv(): { blob: string; origin: string } | null {
  * entorno, se rehidratan. Si ya hay store local, manda el local — reimportar por
  * encima de una sesion viva la rompe.
  */
-export function restoreFromEnvIfNeeded(log: (...args: unknown[]) => void = console.log): boolean {
+export async function restoreFromEnvIfNeeded(log: (...args: unknown[]) => void = console.log): Promise<boolean> {
     const hasLocal = existsSync(config.authPath) && statSync(config.authPath).size > 0
     const fromEnv = credsFromEnv()
 
@@ -312,7 +443,7 @@ export function restoreFromEnvIfNeeded(log: (...args: unknown[]) => void = conso
         return false
     }
 
-    const summary = importCredentials(fromEnv.blob)
+    const summary = await importCredentials(fromEnv.blob)
     log(`credenciales restauradas desde ${fromEnv.origin}: ${summary.meJid ?? 'sin me_jid'} (${summary.bytes} bytes)`)
     return true
 }

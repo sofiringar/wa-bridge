@@ -95,7 +95,7 @@ function runExport(): void {
     console.log('Trata este archivo como una contraseña: da acceso completo a la cuenta de WhatsApp.')
 }
 
-function runImport(): void {
+async function runImport(): Promise<void> {
     ensureDirs()
     const fromEnv = credsFromEnv()
     const fromFile = valueOf('--in')
@@ -120,7 +120,7 @@ function runImport(): void {
     if (!blob.trim()) {
         throw new CredsError(`No llego ningun contenido desde ${origin}.`)
     }
-    const summary = importCredentials(blob, { force: has('--force') })
+    const summary = await importCredentials(blob, { force: has('--force') })
 
     console.log(`credenciales importadas desde ${origin} -> ${summary.authPath}`)
     console.log(`  cuenta   ${summary.meJid ?? '(sin me_jid)'}${summary.pushName ? ` — ${summary.pushName}` : ''}`)
@@ -132,7 +132,7 @@ function runImport(): void {
 
 try {
     if (command === 'export') runExport()
-    else if (command === 'import') runImport()
+    else if (command === 'import') await runImport()
     else {
         console.error('uso: creds-cli <export|import> [opciones]')
         console.error('')

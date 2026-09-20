@@ -126,6 +126,18 @@ npm run creds:import -- --in data/wa-creds.b64 --force
 
 ### Que viaja y que no
 
+Se exporta `data/auth.sqlite` entero **menos el contenido** del buzon de historial
+(`mailbox_*`), los caches reconstruibles, las colas de reintento y las versiones de
+app state — de ahi que un store de 16 MB quepa en ~6 KB de base64. Esas tablas viajan
+**vacias, no eliminadas**: `wa_migrations` viaja intacta, asi que el store que importe
+da por aplicadas sus migraciones y nunca volveria a crearlas. Lo que si viaja con datos
+es todo el material criptografico: credenciales Noise, identidad, prekeys, sesiones y
+claves Signal (incluidas las de app state), mas `wa_migrations`.
+
+Al importar, si el blob viene de una version antigua que si eliminaba esas tablas, se
+recrean copiando el esquema de un store recien migrado. El daemon repite la
+comprobacion al arrancar, asi que un `data/auth.sqlite` ya materializado tambien se
+repara.
 Se exporta `data/auth.sqlite` entero **menos** el buzon de historial
 (`mailbox_*`), los caches reconstruibles y las colas de reintento — de ahi que un store
 de 16 MB quepa en ~95 KB de base64. Lo que si viaja es todo el material criptografico:
@@ -275,6 +287,15 @@ curl "127.0.0.1:8787/messages?chatId=1203630@g.us&from=2026-09-01&to=2026-09-15&
   ]
 }
 ```
+
+**Que trae y que no trae una sesion restaurada**: el volcado del historial solo se
+emite **al emparejar**, y WhatsApp no lo repite, asi que un ambiente que arranca desde
+`WA_CREDS` reanuda la sesion pero sin archivo. No hace falta forzar nada: al reconectar,
+el servidor descarga la rafaga de lo acumulado mientras el dispositivo estuvo fuera
+(*offline resume*) y esos mensajes entran por el evento `message` como los de en vivo.
+Lo que esa rafaga no trae, el daemon lo pide una sola vez con el archivo vacio: la lista
+de grupos (consulta al servidor) y el app state con la libreta de contactos. El
+historial anterior al emparejamiento no es recuperable sin volver a vincular.
 
 **Huecos de cobertura**: si `from` cae antes del mensaje más antiguo archivado, la
 respuesta trae `coverage.gap` y el daemon pide automáticamente backfill al teléfono
