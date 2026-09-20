@@ -1,0 +1,30 @@
+{
+  "name": "wa-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Puente local entre WhatsApp (zapo) y rutinas de Claude Code: historial por chat y rango de fechas, imagenes descifradas al vuelo y audios transcritos con Deepgram.",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "daemon": "tsx src/daemon.ts",
+    "api": "tsx src/api.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@zapo-js/store-sqlite": "^1.0.0",
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "qrcode-terminal": "^0.12.0",
+    "zapo-js": "^1.8.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
